@@ -109,29 +109,25 @@ static io_service_t findCable(void) {
     return found;
 }
 
-// The cable also exposes a tiny CD with the Windows installer; exclusive SCSI access is refused while it's attached.
-// Disk Arbitration's unmount callback does not always fire for this device, so eject the mount directly.
+// The cable also exposes a tiny CD with the Windows installer; exclusive SCSI access is refused while it's mounted.
+// The system mounted it, so unmount(2) gets EPERM and our own DADiskUnmount is refused as "not privileged";
+// diskutil is allowed to unmount it on the user's behalf.
 static void unmountCableCD(io_service_t svc) {
-    io_iterator_t it;
-    if (IORegistryEntryCreateIterator(svc, kIOServicePlane, kIORegistryIterateRecursively, &it)) return;
+    NSString *bsd = CFBridgingRelease(IORegistryEntrySearchCFProperty(svc, kIOServicePlane, CFSTR("BSD Name"), NULL, kIORegistryIterateRecursively));
+    if (!bsd) return;
+    NSString *dev = [@"/dev/" stringByAppendingString:bsd], *part = [dev stringByAppendingString:@"s"];
     struct statfs *mnt = NULL;
-    int n = getmntinfo(&mnt, MNT_NOWAIT);
-    for (io_service_t o; (o = IOIteratorNext(it)); ) {
-        if (IOObjectConformsTo(o, "IOMedia")) {
-            NSString *bsd = CFBridgingRelease(IORegistryEntryCreateCFProperty(o, CFSTR("BSD Name"), 0, 0));
-            if (bsd) {
-                char dev[64];
-                snprintf(dev, sizeof dev, "/dev/%s", bsd.UTF8String);
-                for (int i = 0; i < n; i++) if (!strcmp(mnt[i].f_mntfromname, dev)) {
-                    say(@"Unmounting the cable CD (%s).", mnt[i].f_mntonname);
-                    if (unmount(mnt[i].f_mntonname, MNT_FORCE) && errno != EINVAL && errno != ENOENT)
-                        say(@"Unmount failed: %s", strerror(errno));
-                }
-            }
-        }
-        IOObjectRelease(o);
+    BOOL mounted = NO;
+    for (int i = 0, n = getmntinfo(&mnt, MNT_NOWAIT); i < n; i++) {
+        NSString *from = @(mnt[i].f_mntfromname);
+        if ([from isEqual:dev] || [from hasPrefix:part]) mounted = YES;
     }
-    IOObjectRelease(it);
+    if (!mounted) return;
+    say(@"Unmounting the cable's built-in CD.");
+    NSTask *t = [NSTask launchedTaskWithExecutableURL:[NSURL fileURLWithPath:@"/usr/sbin/diskutil"]
+                                            arguments:@[@"unmountDisk", bsd] error:nil terminationHandler:nil];
+    [t waitUntilExit];
+    if (!t || t.terminationStatus) say(@"diskutil couldn't unmount the cable's CD; eject \"EasySuite\" in Finder and it will carry on.");
 }
 
 // Note: the plug-in object must outlive the MMC interface, so it is only destroyed on close/failure.
@@ -159,7 +155,7 @@ static BOOL openCable(void) {
         io_service_t svc = findCable();
         if (svc) {
             if (gStop) return NO;
-            unmountCableCD(svc);
+            if (i % 20 == 0) unmountCableCD(svc);
             kr = tryOpen(svc);
             IOObjectRelease(svc);
         }
